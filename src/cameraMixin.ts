@@ -1,4 +1,4 @@
-import sdk, { Setting, SettingValue, Settings } from '@scrypted/sdk';
+import sdk, { MediaStreamDestination, ScryptedInterface, Setting, SettingValue, Settings, VideoCamera } from '@scrypted/sdk';
 import { SettingsMixinDeviceBase, SettingsMixinDeviceOptions } from '@scrypted/sdk/settings-mixin';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { MjpegProducer } from './mjpegProducer';
@@ -55,6 +55,8 @@ export class MjpegRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
     frameHubs: Map<string, FrameHub> = new Map();
     /** Maps pathToken → stream name (for status/display) */
     tokenToName: Map<string, string> = new Map();
+    /** Maps stream name → Scrypted MediaStreamDestination (for decoder mode) */
+    private streamDestinations: Map<string, MediaStreamDestination> = new Map();
 
     storageSettings = new StorageSettings(this, {
         mjpegSource: {
@@ -64,9 +66,16 @@ export class MjpegRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
             choices: [
                 MjpegSourceEnum.ScryptedSnapshot,
                 MjpegSourceEnum.ScryptedRtspFfmpeg,
+                MjpegSourceEnum.ScryptedDecoder,
             ],
-            defaultValue: MjpegSourceEnum.ScryptedRtspFfmpeg,
+            defaultValue: MjpegSourceEnum.ScryptedDecoder,
             immediate: true,
+            onPut: async () => {
+                if (this.storageSettings.values.serverEnabled) {
+                    await this.setupStreams();
+                    this.onDeviceEvent(ScryptedInterface.Settings, undefined);
+                }
+            },
         },
         fps: {
             title: 'FPS',
@@ -95,6 +104,7 @@ export class MjpegRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
             onPut: async () => {
                 if (this.storageSettings.values.serverEnabled) {
                     await this.setupStreams();
+                    this.onDeviceEvent(ScryptedInterface.Settings, undefined);
                 }
             },
         },
@@ -107,8 +117,10 @@ export class MjpegRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
                 if (newValue) {
                     await this.discoverStreams();
                     await this.setupStreams();
+                    this.onDeviceEvent(ScryptedInterface.Settings, undefined);
                 } else {
                     await this.teardownStreams();
+                    this.onDeviceEvent(ScryptedInterface.Settings, undefined);
                 }
             },
         },
@@ -159,15 +171,18 @@ export class MjpegRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
 
         if (this.storageSettings.values.serverEnabled) {
             await this.setupStreams();
+            this.onDeviceEvent(ScryptedInterface.Settings, undefined);
         }
     }
 
     async getMixinSettings(): Promise<Setting[]> {
         const mjpegSource = this.storageSettings.values.mjpegSource;
         const isSnapshot = mjpegSource === MjpegSourceEnum.ScryptedSnapshot;
+        const isDecoder = mjpegSource === MjpegSourceEnum.ScryptedDecoder;
 
-        this.storageSettings.settings.width.hide = isSnapshot;
-        this.storageSettings.settings.quality.hide = isSnapshot;
+        this.storageSettings.settings.fps.hide = isSnapshot || isDecoder;
+        this.storageSettings.settings.width.hide = isSnapshot || isDecoder;
+        this.storageSettings.settings.quality.hide = isSnapshot || isDecoder;
         this.storageSettings.settings.prebufferStreams.hide = isSnapshot;
 
         if (this.discoveredStreams.length > 0) {
@@ -207,6 +222,7 @@ export class MjpegRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
 
     private async discoverStreams() {
         this.discoveredStreams = [];
+        this.streamDestinations.clear();
 
         try {
             const device = systemManager.getDeviceById(this.id) as unknown as Settings;
@@ -230,6 +246,22 @@ export class MjpegRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
                 });
             }
 
+            // Discover stream destinations for decoder mode
+            try {
+                const videoDevice = systemManager.getDeviceById(this.id) as unknown as VideoCamera;
+                if (videoDevice?.getVideoStreamOptions) {
+                    const streamOptions = await videoDevice.getVideoStreamOptions();
+                    for (const opt of streamOptions) {
+                        if (opt.name && opt.destinations?.length) {
+                            this.streamDestinations.set(opt.name, opt.destinations[0]);
+                            this.logger.debug(`  destination for "${opt.name}": ${opt.destinations[0]}`);
+                        }
+                    }
+                }
+            } catch (e) {
+                this.logger.debug(`Could not discover stream destinations: ${(e as Error).message}`);
+            }
+
             this.logger.debug(`${this.name}: found ${this.discoveredStreams.length} RTSP stream(s)`);
             for (const s of this.discoveredStreams) {
                 this.logger.debug(`  - ${s.name}: ${s.rtspUrl} (token: ${s.pathToken})`);
@@ -237,6 +269,13 @@ export class MjpegRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
         } catch (e) {
             this.console.warn(`Failed to discover streams for ${this.name}: ${(e as Error).message}`);
         }
+    }
+
+    /**
+     * Map a stream name to its Scrypted MediaStreamDestination (cached during discoverStreams).
+     */
+    private getStreamDestination(streamName: string): MediaStreamDestination | undefined {
+        return this.streamDestinations.get(streamName);
     }
 
     private getPrebufferStreamNames(): Set<string> {
@@ -273,6 +312,10 @@ export class MjpegRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
         try {
             if (mjpegSource === MjpegSourceEnum.ScryptedSnapshot) {
                 await producer.startSnapshotPolling(this.id, fps);
+            } else if (mjpegSource === MjpegSourceEnum.ScryptedDecoder) {
+                const stream = this.discoveredStreams.find(s => s.pathToken === token);
+                const destination = stream ? this.getStreamDestination(stream.name) : undefined;
+                await producer.startDecoderStream(this.id, destination);
             } else {
                 const stream = this.discoveredStreams.find(s => s.pathToken === token);
                 if (stream) {
@@ -355,12 +398,13 @@ export class MjpegRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
     private async setupStreams() {
         await this.teardownStreams();
 
-        if (this.discoveredStreams.length === 0 && this.storageSettings.values.mjpegSource === MjpegSourceEnum.ScryptedRtspFfmpeg) {
+        const mjpegSource = this.storageSettings.values.mjpegSource;
+
+        if (this.discoveredStreams.length === 0 && mjpegSource !== MjpegSourceEnum.ScryptedSnapshot) {
             this.logger.debug(`No streams found for ${this.name}, trying to discover...`);
             await this.discoverStreams();
         }
 
-        const mjpegSource = this.storageSettings.values.mjpegSource;
         const prebufferNames = this.getPrebufferStreamNames();
 
         try {
@@ -373,9 +417,9 @@ export class MjpegRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
                 this.tokenToName.set(token, 'Snapshot');
 
                 this.console.log(`${this.name}: MJPEG snapshot endpoint ready (on-demand)`);
-            } else if (mjpegSource === MjpegSourceEnum.ScryptedRtspFfmpeg) {
+            } else if (mjpegSource === MjpegSourceEnum.ScryptedRtspFfmpeg || mjpegSource === MjpegSourceEnum.ScryptedDecoder) {
                 if (this.discoveredStreams.length === 0) {
-                    this.console.warn(`No RTSP streams found for ${this.name}. Make sure the Rebroadcast plugin is installed.`);
+                    this.console.warn(`No streams found for ${this.name}. Make sure the Rebroadcast plugin is installed.`);
                     return;
                 }
 
@@ -409,7 +453,8 @@ export class MjpegRebroadcastCameraMixin extends SettingsMixinDeviceBase<any> {
                 }
 
                 const onDemandCount = this.discoveredStreams.length - prebufferTokens.length;
-                this.console.log(`${this.name}: ${this.discoveredStreams.length} MJPEG endpoint(s) ready (${prebufferTokens.length} prebuffer, ${onDemandCount} on-demand)`);
+                const sourceLabel = mjpegSource === MjpegSourceEnum.ScryptedDecoder ? 'decoder' : 'FFmpeg';
+                this.console.log(`${this.name}: ${this.discoveredStreams.length} MJPEG endpoint(s) ready via ${sourceLabel} (${prebufferTokens.length} prebuffer, ${onDemandCount} on-demand)`);
             }
 
             // Start periodic health check for producer restarts

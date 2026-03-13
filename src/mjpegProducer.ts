@@ -1,12 +1,16 @@
-import sdk, { Camera, Settings } from '@scrypted/sdk';
+import sdk, { Camera, Image, MediaStreamDestination, ScryptedInterface, ScryptedMimeTypes, Settings, VideoCamera, VideoFrame, VideoFrameGenerator } from '@scrypted/sdk';
 
 const { systemManager, mediaManager } = sdk;
 const { spawn } = require('child_process');
+
+const NVR_PLUGIN_ID = '@scrypted/nvr';
+const VIDEO_ANALYSIS_PLUGIN_ID = '@scrypted/objectdetector';
 
 export class MjpegProducer {
     private console: Console;
     private snapshotInterval: NodeJS.Timeout | null = null;
     private ffmpegProcess: any = null;
+    private decoderAbort: (() => void) | null = null;
     private running = false;
     debugLog: (message: string, ...args: any[]) => void = () => {};
     onFrame: (frame: Buffer) => void = () => {};
@@ -136,6 +140,99 @@ export class MjpegProducer {
         });
     }
 
+    async startDecoderStream(
+        deviceId: string,
+        streamDestination?: MediaStreamDestination,
+    ): Promise<void> {
+        this.stop();
+        this.running = true;
+
+        const device = systemManager.getDeviceById(deviceId) as unknown as VideoCamera;
+        if (!device?.getVideoStream) {
+            throw new Error(`Device ${deviceId} does not support VideoCamera interface`);
+        }
+
+        this.debugLog(`Starting Scrypted decoder stream for device ${deviceId} (destination: ${streamDestination ?? 'auto'})`);
+
+        let aborted = false;
+        this.decoderAbort = () => { aborted = true; };
+
+        const runDecoder = async (skipDecoder: boolean) => {
+            const stream = await device.getVideoStream({
+                prebuffer: 0,
+                destination: streamDestination,
+                audio: null,
+            });
+
+            let frameGenerator: AsyncGenerator<VideoFrame, any, unknown>;
+
+            if (!skipDecoder) {
+                frameGenerator = stream as unknown as AsyncGenerator<VideoFrame, any, unknown>;
+            } else {
+                const videoFrameGenerator = this.findFrameGenerator();
+                if (!videoFrameGenerator) {
+                    throw new Error('No VideoFrameGenerator found (install NVR or Object Detection plugin)');
+                }
+                frameGenerator = await videoFrameGenerator.generateVideoFrames(stream, { queue: 0 });
+            }
+
+            for await (const frame of await sdk.connectRPCObject(frameGenerator)) {
+                if (aborted || !this.running) break;
+
+                try {
+                    const convertedImage = await mediaManager.convertMediaObject<Image>(
+                        frame.image,
+                        ScryptedMimeTypes.Image,
+                    );
+                    const image = await convertedImage.toImage({ format: 'jpeg' });
+                    const buffer = await image.toBuffer({ format: 'jpg' });
+                    this.onFrame(Buffer.from(buffer));
+                } catch (e) {
+                    this.debugLog(`Decoder frame conversion failed: ${(e as Error).message}`);
+                }
+            }
+        };
+
+        // Run in background with fallback: try native decoder first, then VideoFrameGenerator
+        (async () => {
+            while (this.running && !aborted) {
+                try {
+                    await runDecoder(false);
+                } catch (e) {
+                    this.debugLog(`Native decoder failed, trying VideoFrameGenerator fallback: ${(e as Error).message}`);
+                    try {
+                        await runDecoder(true);
+                    } catch (e2) {
+                        this.console.error(`Decoder failed: ${(e2 as Error).message}`);
+                    }
+                }
+
+                if (this.running && !aborted) {
+                    this.console.warn('Decoder stream ended, restarting in 5 seconds...');
+                    await new Promise(r => setTimeout(r, 5000));
+                }
+            }
+        })();
+    }
+
+    private findFrameGenerator(): VideoFrameGenerator | undefined {
+        const webassembly = systemManager.getDeviceById(NVR_PLUGIN_ID, 'decoder') as unknown as VideoFrameGenerator;
+        if (webassembly) return webassembly;
+
+        const ffmpeg = systemManager.getDeviceById(VIDEO_ANALYSIS_PLUGIN_ID, 'ffmpeg') as unknown as VideoFrameGenerator;
+        if (ffmpeg) return ffmpeg;
+
+        // Search for any device implementing VideoFrameGenerator
+        for (const id of Object.keys(systemManager.getSystemState())) {
+            const d = systemManager.getDeviceById(id);
+            if (d?.interfaces?.includes(ScryptedInterface.VideoFrameGenerator)) {
+                return d as unknown as VideoFrameGenerator;
+            }
+        }
+
+        return undefined;
+    }
+
     private async getFfmpegPath(): Promise<string> {
         try {
             const ffmpegDevice = systemManager.getDeviceByName('FFmpeg');
@@ -163,6 +260,11 @@ export class MjpegProducer {
                 this.ffmpegProcess.kill('SIGTERM');
             } catch { /* ignore */ }
             this.ffmpegProcess = null;
+        }
+
+        if (this.decoderAbort) {
+            this.decoderAbort();
+            this.decoderAbort = null;
         }
     }
 
