@@ -1,4 +1,7 @@
 import sdk, {
+    HttpRequest,
+    HttpRequestHandler,
+    HttpResponse,
     MixinProvider,
     ScryptedDeviceBase,
     ScryptedDeviceType,
@@ -10,31 +13,34 @@ import sdk, {
 } from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { MjpegRebroadcastCameraMixin } from './cameraMixin';
+import { MJPEG_BOUNDARY } from './frameHub';
+
+const { endpointManager } = sdk;
 
 export default class MjpegRebroadcastPlugin
     extends ScryptedDeviceBase
-    implements Settings, MixinProvider
+    implements Settings, MixinProvider, HttpRequestHandler
 {
     currentMixinsMap: Record<string, MjpegRebroadcastCameraMixin> = {};
+    private endpointUrlCache: string | null = null;
 
-    storageSettings = new StorageSettings(this, {
-        username: {
-            title: 'Username',
-            description: 'Username for HTTP Basic auth (leave empty to disable auth)',
-            type: 'string',
-            group: 'Authentication',
-        },
-        password: {
-            title: 'Password',
-            description: 'Password for HTTP Basic auth',
-            type: 'password',
-            group: 'Authentication',
-        },
-    });
+    storageSettings = new StorageSettings(this, {});
 
     constructor(nativeId: string) {
         super(nativeId);
         this.console.log('MJPEG Rebroadcast plugin loaded');
+    }
+
+    async getEndpointUrl(): Promise<string> {
+        if (this.endpointUrlCache) return this.endpointUrlCache;
+
+        let url = await endpointManager.getLocalEndpoint(undefined, {
+            public: true,
+            insecure: true,
+        });
+        url = url.replace(/\/+$/, '');
+        this.endpointUrlCache = url;
+        return url;
     }
 
     async getSettings(): Promise<Setting[]> {
@@ -60,16 +66,7 @@ export default class MjpegRebroadcastPlugin
         mixinDeviceInterfaces: ScryptedInterface[],
         mixinDeviceState: WritableDeviceState,
     ): Promise<any> {
-        const existing = this.currentMixinsMap[mixinDeviceState.id];
-        if (existing) {
-            this.console.log(`Releasing previous mixin for ${mixinDeviceState.name} before creating new one`);
-            try {
-                await existing.release();
-            } catch (e) {
-                this.console.warn(`Error releasing previous mixin: ${(e as Error).message}`);
-            }
-        }
-
+        // Mixin self-registers in its constructor via this.plugin.currentMixinsMap
         const mixin = new MjpegRebroadcastCameraMixin(
             {
                 mixinDevice,
@@ -82,16 +79,68 @@ export default class MjpegRebroadcastPlugin
             this,
         );
 
-        this.currentMixinsMap[mixinDeviceState.id] = mixin;
         return mixin;
     }
 
     async releaseMixin(id: string, mixinDevice: any): Promise<void> {
-        delete this.currentMixinsMap[id];
+        // Do NOT delete from currentMixinsMap here — Scrypted calls releaseMixin
+        // for the OLD mixin AFTER getMixin has already stored the NEW one.
+        // The new mixin constructor overwrites the map entry.
         try {
             await mixinDevice.release();
         } catch (e) {
-            this.console.warn(`Error releasing mixin ${id}: ${(e as Error).message}`);
+            // this.console.warn(`Error releasing mixin ${id}: ${(e as Error).message}`);
         }
+    }
+
+    async onRequest(request: HttpRequest, response: HttpResponse): Promise<void> {
+        const requestUrl = request.url || '';
+
+        // Extract the token: everything after /public/
+        const publicIdx = requestUrl.indexOf('/public/');
+        const token = publicIdx !== -1 ? requestUrl.slice(publicIdx + '/public/'.length) : '';
+
+        if (!token) {
+            // Global status
+            const streams: Record<string, { deviceName: string; streamName: string; subscribers: number }> = {};
+            for (const mixin of Object.values(this.currentMixinsMap)) {
+                if (mixin.killed) continue;
+                for (const [tok] of mixin.frameHubs) {
+                    streams[tok] = {
+                        deviceName: mixin.name,
+                        streamName: mixin.tokenToName.get(tok) ?? tok,
+                        subscribers: mixin.frameHubs.get(tok)?.subscriberCount ?? 0,
+                    };
+                }
+            }
+
+            response.send(JSON.stringify({ streams }, null, 2), {
+                code: 200,
+                headers: { 'Content-Type': 'application/json' },
+            });
+            return;
+        }
+
+        // Find the hub by token across all active mixins
+        for (const mixin of Object.values(this.currentMixinsMap)) {
+            if (mixin.killed) continue;
+            const hub = mixin.frameHubs.get(token);
+            if (hub) {
+                const generator = hub.subscribe();
+                response.sendStream(generator, {
+                    code: 200,
+                    headers: {
+                        'Content-Type': `multipart/x-mixed-replace; boundary=${MJPEG_BOUNDARY}`,
+                        'Cache-Control': 'no-cache, no-store, must-revalidate',
+                        'Pragma': 'no-cache',
+                        'Expires': '0',
+                        'Connection': 'keep-alive',
+                    },
+                });
+                return;
+            }
+        }
+
+        response.send('Not found', { code: 404 });
     }
 }

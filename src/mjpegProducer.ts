@@ -1,5 +1,4 @@
 import sdk, { Camera, Settings } from '@scrypted/sdk';
-import { MjpegServer } from './mjpegServer';
 
 const { systemManager, mediaManager } = sdk;
 const { spawn } = require('child_process');
@@ -9,17 +8,15 @@ export class MjpegProducer {
     private snapshotInterval: NodeJS.Timeout | null = null;
     private ffmpegProcess: any = null;
     private running = false;
+    debugLog: (message: string, ...args: any[]) => void = () => {};
+    onFrame: (frame: Buffer) => void = () => {};
 
     constructor(console: Console) {
         this.console = console;
     }
 
-    /**
-     * Start producing MJPEG frames via snapshot polling from the camera device.
-     */
     async startSnapshotPolling(
         deviceId: string,
-        server: MjpegServer,
         fps: number = 2,
     ): Promise<void> {
         this.stop();
@@ -31,7 +28,7 @@ export class MjpegProducer {
         }
 
         const intervalMs = Math.max(100, Math.round(1000 / fps));
-        this.console.log(`Starting snapshot polling at ${fps} fps (${intervalMs}ms interval)`);
+        this.debugLog(`Starting snapshot polling at ${fps} fps (${intervalMs}ms interval)`);
 
         const captureFrame = async () => {
             if (!this.running) return;
@@ -39,7 +36,7 @@ export class MjpegProducer {
             try {
                 const picture = await device.takePicture();
                 const buffer = await mediaManager.convertMediaObjectToBuffer(picture, 'image/jpeg');
-                server.pushFrame(Buffer.from(buffer));
+                this.onFrame(Buffer.from(buffer));
             } catch (e) {
                 this.console.warn(`Snapshot capture failed: ${(e as Error).message}`);
             }
@@ -49,12 +46,8 @@ export class MjpegProducer {
         this.snapshotInterval = setInterval(captureFrame, intervalMs);
     }
 
-    /**
-     * Start producing MJPEG frames from an RTSP stream via FFmpeg.
-     */
     async startRtspToMjpeg(
         rtspUrl: string,
-        server: MjpegServer,
         fps: number = 5,
         quality: number = 80,
         width?: number,
@@ -62,13 +55,12 @@ export class MjpegProducer {
         this.stop();
         this.running = true;
 
-        this.console.log(`Starting RTSP→MJPEG conversion: ${rtspUrl}`);
-        await this.startFfmpegMjpeg(rtspUrl, server, fps, quality, width);
+        this.debugLog(`Starting RTSP→MJPEG conversion: ${rtspUrl}`);
+        await this.startFfmpegMjpeg(rtspUrl, fps, quality, width);
     }
 
     private async startFfmpegMjpeg(
         inputUrl: string,
-        server: MjpegServer,
         fps: number,
         quality: number,
         width?: number,
@@ -90,7 +82,7 @@ export class MjpegProducer {
 
         args.push('-');
 
-        this.console.log(`FFmpeg command: ${ffmpegPath} ${args.join(' ')}`);
+        this.debugLog(`FFmpeg command: ${ffmpegPath} ${args.join(' ')}`);
 
         this.ffmpegProcess = spawn(ffmpegPath, args, {
             stdio: ['pipe', 'pipe', 'pipe'],
@@ -101,7 +93,6 @@ export class MjpegProducer {
         this.ffmpegProcess.stdout.on('data', (data: Buffer) => {
             jpegBuffer = Buffer.concat([jpegBuffer, data]);
 
-            // JPEG files start with 0xFFD8 and end with 0xFFD9
             while (true) {
                 const startIdx = jpegBuffer.indexOf(Buffer.from([0xFF, 0xD8]));
                 if (startIdx === -1) {
@@ -113,7 +104,7 @@ export class MjpegProducer {
                 if (endIdx === -1) break;
 
                 const frame = jpegBuffer.subarray(startIdx, endIdx + 2);
-                server.pushFrame(Buffer.from(frame));
+                this.onFrame(Buffer.from(frame));
 
                 jpegBuffer = jpegBuffer.subarray(endIdx + 2);
             }
@@ -122,19 +113,19 @@ export class MjpegProducer {
         this.ffmpegProcess.stderr.on('data', (data: Buffer) => {
             const msg = data.toString().trim();
             if (msg) {
-                this.console.debug(`FFmpeg: ${msg}`);
+                this.debugLog(`FFmpeg: ${msg}`);
             }
         });
 
         this.ffmpegProcess.on('close', (code: number) => {
-            this.console.log(`FFmpeg process exited with code ${code}`);
+            this.console.log(`FFmpeg process exited with code ${code} (running=${this.running})`);
             this.ffmpegProcess = null;
 
             if (this.running && code !== 0) {
-                this.console.log('FFmpeg exited unexpectedly, restarting in 5 seconds...');
+                this.console.warn('FFmpeg exited unexpectedly, restarting in 5 seconds...');
                 setTimeout(() => {
                     if (this.running) {
-                        this.startFfmpegMjpeg(inputUrl, server, fps, quality, width);
+                        this.startFfmpegMjpeg(inputUrl, fps, quality, width);
                     }
                 }, 5000);
             }
@@ -167,6 +158,7 @@ export class MjpegProducer {
         }
 
         if (this.ffmpegProcess) {
+            this.console.log('Sending SIGTERM to FFmpeg process');
             try {
                 this.ffmpegProcess.kill('SIGTERM');
             } catch { /* ignore */ }

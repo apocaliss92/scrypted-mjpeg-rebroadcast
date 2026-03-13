@@ -33,7 +33,8 @@
       "type": "API",
       "interfaces": [
          "Settings",
-         "MixinProvider"
+         "MixinProvider",
+         "HttpRequestHandler"
       ],
       "pluginDependencies": []
    },
