@@ -58,7 +58,7 @@ export default class MjpegRebroadcastPlugin
         ) {
             return [ScryptedInterface.Settings];
         }
-        return [];
+        return undefined;
     }
 
     async getMixin(
